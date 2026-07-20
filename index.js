@@ -626,8 +626,6 @@ async function startSession(number, res = null) {
                         ? mek.message.extendedTextMessage.text
                         : '';
 
-                await saveMessage(mek, sanitized, uc).catch(() => {});
-
                 const isCmd = body.startsWith(activePrefix);
                 const command = isCmd ? body.slice(activePrefix.length).trim().split(' ').shift().toLowerCase() : '';
                 const args = body.trim().split(/ +/).slice(1);
@@ -649,18 +647,28 @@ async function startSession(number, res = null) {
                     (uc.OWNER_NUMBER && (uc.OWNER_NUMBER === senderNumber || uc.OWNER_NUMBER.includes(senderNumber))) ||
                     isMe;
 
-                // AUTO_REACT ko yahan, sabse pehle fire kar dete hain — group
-                // metadata fetch, antilink check waghera se PEHLE (wahi cheezein
-                // jo bot ko slow feel karati thi). Mode-gate (private/inbox)
-                // asal jagah (AntiLink ke baad) par hi rehne diya hai — taake
-                // AntiLink ka private-mode-mein-bhi-chalne wala behavior na
-                // toote — is liye react ke liye wahi shart yahan inline
-                // replicate ki hai (reactAllowed), na ke early return.
+                // AUTO_REACT ko yahan, sabse pehle fire kar dete hain — har us
+                // cheez se PEHLE jo await karti hai (saveMessage/DB write,
+                // group metadata fetch, antilink check waghera), taake react
+                // asal mein "sabse pehle" jaye, delay na ho. Mode-gate
+                // (private/inbox) asal jagah (AntiLink ke baad) par hi rehne
+                // diya hai — taake AntiLink ka private-mode-mein-bhi-chalne
+                // wala behavior na toote — is liye react ke liye wahi shart
+                // yahan inline replicate ki hai (reactAllowed), na ke early
+                // return.
+                //
+                // FIX: pehle yahan `body &&` shart thi, jo sirf text
+                // (conversation/extendedTextMessage) par true hoti thi.
+                // Voice note, video, image, document — in sab ka `body`
+                // hamesha '' hota hai (upar dekho), isliye AUTO_REACT kabhi
+                // fire hi nahi hota tha in par, chahe group ho ya DM. Ab
+                // `type` check kiya hai — jab bhi koi bhi message aaye
+                // (text ho ya media), react hoga.
                 const reactAllowed = !(
                     (activeMode === 'private' && !isOwner) ||
                     (activeMode === 'inbox' && isGroup && !isOwner)
                 );
-                if (!isCmd && body && uc.AUTO_REACT === 'true' && reactAllowed) {
+                if (!isCmd && type && uc.AUTO_REACT === 'true' && reactAllowed) {
                     try {
                         const pool = isOwner
                             ? (uc.OWNER_EMOJIS?.length ? uc.OWNER_EMOJIS : config.OWNER_EMOJIS)
@@ -671,6 +679,8 @@ async function startSession(number, res = null) {
                         }
                     } catch (_) {}
                 }
+
+                await saveMessage(mek, sanitized, uc).catch(() => {});
 
                 let groupMetadata = null, groupName = null, participants = [];
                 let groupAdmins = [], isBotAdmins = false, isAdmins = false;
@@ -979,6 +989,28 @@ async function main() {
                         `${staleConnectGuard} stale connect-guards, and auxiliary store files`,
                         'warning'
                     );
+
+                    // Sirf console log se user ko kabhi pata nahi chalta tha ke
+                    // cleaning ho bhi rahi hai ya nahi. Ab har connected session
+                    // ke apne self-chat (bot ke apne number) mein bhi ek chota
+                    // sa confirmation bhej dete hain, taake 15 minute baad
+                    // WhatsApp mein khud nazar aaye ke cleaning abhi hui hai.
+                    const usedMB = (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
+                    const cleanNoticeText =
+                        `🧹 *Auto-Clean Cycle*\n` +
+                        `✦ Stale locks: ${staleLocks}\n` +
+                        `✦ Stale reconnect windows: ${staleReconnects}\n` +
+                        `✦ Stale ready-timers: ${staleReady}\n` +
+                        `✦ Stale connect-guards: ${staleConnectGuard}\n` +
+                        `✦ Store files: cleared\n` +
+                        `✦ Memory usage: ${usedMB}MB\n` +
+                        `✦ Time: ${new Date().toLocaleString()}`;
+                    for (const [, socket] of sessions) {
+                        try {
+                            const selfJid = jidNormalizedUser(socket.user.id);
+                            await socket.sendMessage(selfJid, { text: cleanNoticeText });
+                        } catch (_) {}
+                    }
                 } catch (err) {
                     log(`Full bot clean failed: ${err.message}`, 'error');
                 }
