@@ -7,7 +7,7 @@
 // AntiLink Fix
 // Connected Spam Fix
 // Follow Repo Support
-// AntiDelete uses lib/store.js (file-based, auto-clears every 4 min)
+// AntiDelete/AntiEdit use lib/store.js (per-session, 200-msg limit, 5-min auto-clear)
 
 import express from 'express';
 import fs from 'fs-extra';
@@ -34,10 +34,10 @@ import { commands, cmd } from './command.js';
 import { sms } from './lib/handler.js';
 import { AntiDelete } from './lib/antidel.js';
 import AntiEdit from './lib/antiedit.js';
-import GroupEvents, { pruneGroupEventCache } from './lib/groupevents.js';
+import GroupEvents from './lib/groupevents.js';
 import { addConnectionFunctions } from './lib/connection.js';
 import { getGroupAdmins, lidToPhone } from './lib/functions.js';
-import { saveMessage, pruneMessageCache } from './lib/store.js';
+import { saveMessage, cleanAuxiliaryStore } from './lib/store.js';
 import { startMemoryWatchdog } from './lib/memoryWatchdog.js';
 import {
     connectMongo,
@@ -80,30 +80,6 @@ const sessionReadyAt = new Map();
 const GROUP_SYNC_GRACE_MS = 20000;
 const GROUP_SYNC_BULK_THRESHOLD = 3;
 
-// Group Metadata Cache
-// PERF FIX: pehle har single group message pe `conn.groupMetadata(from)`
-// call hota tha — matlab ek fresh live query WhatsApp servers se, HAR
-// message ke liye, sirf isliye ke sender/bot admin hai ya nahi pata
-// chale. Yehi sabse bada wajah tha "group slow", command response late,
-// aur socket overload se disconnects. Ab metadata GROUP_METADATA_TTL_MS
-// tak cache hoti hai — sirf pehli baar (ya cache expire hone par) fresh
-// query hoti hai, baaki messages usi cached copy se kaam chalate hain.
-// group-participants.update aane par (kisi ko add/remove/promote/demote
-// kiya) cache turant invalidate ho jaati hai, taake admin status stale na
-// rahe.
-const groupMetadataCache = new Map(); // jid -> { metadata, timestamp }
-const GROUP_METADATA_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-async function getCachedGroupMetadata(conn, jid) {
-    const cached = groupMetadataCache.get(jid);
-    if (cached && Date.now() - cached.timestamp < GROUP_METADATA_TTL_MS) {
-        return cached.metadata;
-    }
-    const metadata = await conn.groupMetadata(jid);
-    groupMetadataCache.set(jid, { metadata, timestamp: Date.now() });
-    return metadata;
-}
-
 // WhatsApp Link Regex
 const LINK_REGEX = /(chat\.whatsapp\.com\/\S+)|(whatsapp\.com\/channel\/\S+)/i;
 
@@ -131,21 +107,9 @@ function log(msg, type = 'info') {
 }
 
 // Fetch Raw File
-// Cache-busted + no-store: raw.githubusercontent.com sits behind a CDN
-// (Fastly) that can keep serving an old cached copy of a file for a
-// while after you push a new commit. That's what was causing "restart
-// loads OLD plugins/follow/reaction files, not the fresh ones I just
-// uploaded" — the temp cache on disk was being cleared correctly, but
-// the fetch itself was getting a stale response from GitHub's CDN.
-// Adding a unique cache-busting query param + no-store forces a real
-// fresh fetch every time.
 async function fetchRawText(url) {
     try {
-        const bustedUrl = url + (url.includes('?') ? '&' : '?') + `_cb=${Date.now()}`;
-        const res = await fetch(bustedUrl, {
-            cache: 'no-store',
-            headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
-        });
+        const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return await res.text();
     } catch (e) {
@@ -154,36 +118,15 @@ async function fetchRawText(url) {
     }
 }
 
-// Clear cached plugin/newsletter/reaction files before every (re)load —
-// so a bot restart always re-downloads fresh copies from the GitHub repo
-// instead of re-importing whatever was already sitting on disk from the
-// last run (old external plugins, old follow-repo temp file, old
-// reaction-repo temp file). This guarantees restarts always pick up
-// whatever is newest/updated on the repo.
-async function clearTempPlugins() {
-    const tempDir = path.join(__dirname, '.temp_plugins');
-    let deletedCount = 0;
-    try {
-        if (fsSync.existsSync(tempDir)) {
-            deletedCount = (await fs.readdir(tempDir)).length;
-        }
-        await fs.remove(tempDir);
-        await fs.ensureDir(tempDir);
-    } catch (e) {
-        log(`Failed to clear .temp_plugins: ${e.message}`, 'warning');
-    }
-}
-
 // Load External Plugins
 async function loadExternalPlugins() {
-    const apiUrl = `https://api.github.com/repos/ai-090/ai-tech/contents/plugins?_cb=${Date.now()}`;
+    log('Loading external plugins from GitHub...');
+
+    const apiUrl = 'https://api.github.com/repos/ai-290/ai/contents/plugins';
     let pluginFiles = [];
 
     try {
-        const res = await fetch(apiUrl, {
-            cache: 'no-store',
-            headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
-        });
+        const res = await fetch(apiUrl);
         if (res.ok) {
             const data = await res.json();
             pluginFiles = data.filter(f => f.name.endsWith('.js')).map(f => f.name);
@@ -198,53 +141,37 @@ async function loadExternalPlugins() {
         return;
     }
 
-    // Purani commands list poori tarah clear karo, sirf tabhi jab hum
-    // confirm kar chuke hain ke repo se fresh file-list mil gayi hai (agar
-    // GitHub API hi fail ho jaye to upar wale check se function already
-    // return kar chuka hoga — is se bot bina kisi command ke nahi reh
-    // jaata). Ab jo bhi command "commands[]" mein hai wo sirf isi reload
-    // se banega — koi purani/deleted-file wali command kabhi bache nahi
-    // rahegi, chahe wo pehle kisi bhi wajah se array mein reh gayi ho.
-    commands.length = 0;
-
-    const loadedFiles = [];
-    const failedFiles = [];
+    log(`Found ${pluginFiles.length} external plugins...`);
 
     for (const file of pluginFiles) {
         const rawUrl = `${PLUGINS_REPO}/${file}`;
         try {
             const code = await fetchRawText(rawUrl);
-            if (!code) { failedFiles.push(file); continue; }
+            if (!code) continue;
 
             const tempPath = path.join(__dirname, '.temp_plugins', file);
             await fs.ensureDir(path.dirname(tempPath));
             await fs.writeFile(tempPath, code);
 
             await import(tempPath + `?update=${Date.now()}`);
-            loadedFiles.push(file);
+            log(`Loaded external plugin: ${file}`, 'success');
         } catch (e) {
-            failedFiles.push(file);
+            log(`Failed to load external plugin ${file}: ${e.message}`, 'error');
         }
     }
 
-    // Sirf ek clean summary line — per-file "Loaded X.js" ki jagah.
-    // Agar koi file fail hui ho to wo count bhi isi ek line mein
-    // dikhti hai (file names ke bina), taake logs saaf rahein lekin
-    // failure ka pata bhi chalta rahe.
-    log(
-        `📦 ERFAN-MD: ${loadedFiles.length} plugin${loadedFiles.length === 1 ? '' : 's'} loaded` +
-        (failedFiles.length ? ` (${failedFiles.length} failed)` : ''),
-        'success'
-    );
+    log(`Total commands loaded: ${commands.length}`, 'success');
 }
 
 // Load Newsletters Manager
 let newsletterManager = null;
 
 async function loadNewslettersManager() {
+    log('Loading newsletters manager...');
     try {
         const mod = await import('./lib/newsletters.js?update=' + Date.now());
         newsletterManager = mod.default || mod;
+        log('Newsletters manager loaded successfully', 'success');
     } catch (e) {
         log(`Failed to load newsletters: ${e.message}`, 'error');
     }
@@ -438,7 +365,6 @@ async function startSession(number, res = null) {
             browser: Browsers.macOS('Safari'),
             markOnlineOnConnect: true,
             syncFullHistory: false,
-            cachedGroupMetadata: async (jid) => groupMetadataCache.get(jid)?.metadata,
         });
         await addConnectionFunctions(conn);
         sessionStartedAt.set(sanitized, Date.now());
@@ -483,7 +409,7 @@ async function startSession(number, res = null) {
         conn.ev.on('messages.update', async (updates) => {
             for (const u of updates) {
                 if (u.update?.message === null) {
-                    await AntiDelete(conn, [u]).catch(() => {});
+                    await AntiDelete(conn, [u], sanitized).catch(() => {});
                 }
             }
         });
@@ -633,13 +559,6 @@ async function startSession(number, res = null) {
         });
 
         conn.ev.on('group-participants.update', (update) => {
-            // Admin/participant list badal gayi — cache turant invalidate,
-            // taake agla message fresh metadata la kar sahi admin status
-            // dikhaye (chahe upar wali grace/bulk checks is event ko
-            // silently ignore kar dein, cache phir bhi stale nahi rehni
-            // chahiye).
-            if (update?.id) groupMetadataCache.delete(update.id);
-
             const readyAt = sessionReadyAt.get(sanitized);
             if (readyAt && Date.now() - readyAt < GROUP_SYNC_GRACE_MS) {
                 log(`Ignoring group-participants.update for ${sanitized} — inside post-connect sync grace period`, 'debug');
@@ -668,7 +587,7 @@ async function startSession(number, res = null) {
                 const activeMode = uc.MODE || config.MODE;
 
                 if (mek.message?.protocolMessage?.editedMessage) {
-                    await AntiEdit(conn, mek).catch(() => {});
+                    await AntiEdit(conn, mek, sanitized).catch(() => {});
                     return;
                 }
 
@@ -707,7 +626,7 @@ async function startSession(number, res = null) {
                         ? mek.message.extendedTextMessage.text
                         : '';
 
-                await saveMessage(mek, uc).catch(() => {});
+                await saveMessage(mek, sanitized, uc).catch(() => {});
 
                 const isCmd = body.startsWith(activePrefix);
                 const command = isCmd ? body.slice(activePrefix.length).trim().split(' ').shift().toLowerCase() : '';
@@ -730,11 +649,34 @@ async function startSession(number, res = null) {
                     (uc.OWNER_NUMBER && (uc.OWNER_NUMBER === senderNumber || uc.OWNER_NUMBER.includes(senderNumber))) ||
                     isMe;
 
+                // AUTO_REACT ko yahan, sabse pehle fire kar dete hain — group
+                // metadata fetch, antilink check waghera se PEHLE (wahi cheezein
+                // jo bot ko slow feel karati thi). Mode-gate (private/inbox)
+                // asal jagah (AntiLink ke baad) par hi rehne diya hai — taake
+                // AntiLink ka private-mode-mein-bhi-chalne wala behavior na
+                // toote — is liye react ke liye wahi shart yahan inline
+                // replicate ki hai (reactAllowed), na ke early return.
+                const reactAllowed = !(
+                    (activeMode === 'private' && !isOwner) ||
+                    (activeMode === 'inbox' && isGroup && !isOwner)
+                );
+                if (!isCmd && body && uc.AUTO_REACT === 'true' && reactAllowed) {
+                    try {
+                        const pool = isOwner
+                            ? (uc.OWNER_EMOJIS?.length ? uc.OWNER_EMOJIS : config.OWNER_EMOJIS)
+                            : (uc.REACT_EMOJIS?.length ? uc.REACT_EMOJIS : config.REACT_EMOJIS);
+                        if (pool?.length) {
+                            const emoji = pool[Math.floor(Math.random() * pool.length)];
+                            conn.sendMessage(from, { react: { text: emoji, key: mek.key } }).catch(() => {});
+                        }
+                    } catch (_) {}
+                }
+
                 let groupMetadata = null, groupName = null, participants = [];
                 let groupAdmins = [], isBotAdmins = false, isAdmins = false;
                 if (isGroup) {
                     try {
-                        groupMetadata = await getCachedGroupMetadata(conn, from);
+                        groupMetadata = await conn.groupMetadata(from);
                         groupName = groupMetadata.subject;
                         participants = groupMetadata.participants;
                         groupAdmins = getGroupAdmins(participants);
@@ -746,46 +688,29 @@ async function startSession(number, res = null) {
                         const botLidNum = conn.user?.lid
                             ? jidNormalizedUser(conn.user.lid).split('@')[0]
                             : null;
-
-                        // PERF FIX: pehle yahan do alag loops the — pehla
-                        // loop isBotAdmins (cheap, sync) nikalta tha, phir
-                        // dusra loop HAR admin ke liye dobara lidToPhone()
-                        // (async, signal-repository lookup) call kar ke
-                        // isBotAdmins DOBARA + isAdmins nikalta tha. Kisi
-                        // bhi group message pe, jitne bhi admins the, utni
-                        // extra async calls ho rahi thi — kayi-admin wale
-                        // groups mein yeh "group slow" ka ek aur bada
-                        // factor tha. Ab ek hi loop mein dono nikalte hain,
-                        // lidToPhone sirf tab call hota hai jab zaroorat
-                        // ho, aur dono mil jaane par loop turant ruk jaata
-                        // hai.
                         for (const adminId of groupAdmins) {
-                            if (isBotAdmins && isAdmins) break;
-
                             const adminIsLid = adminId.endsWith('@lid');
                             const adminRawNum = adminId.split('@')[0];
-
-                            if (!isBotAdmins) {
-                                if (adminIsLid) {
-                                    if (botLidNum && adminRawNum === botLidNum) isBotAdmins = true;
-                                } else if (adminRawNum === botNumber) {
-                                    isBotAdmins = true;
-                                }
+                            if (adminIsLid) {
+                                if (botLidNum && adminRawNum === botLidNum) isBotAdmins = true;
+                            } else if (adminRawNum === botNumber) {
+                                isBotAdmins = true;
                             }
+                        }
 
-                            if (!isAdmins) {
-                                const adminPhone = adminIsLid ? await lidToPhone(conn, adminId) : adminRawNum;
-                                if (adminPhone === senderPhone) isAdmins = true;
-                            }
+                        for (const adminId of groupAdmins) {
+                            const adminPhone = adminId.endsWith('@lid')
+                                ? await lidToPhone(conn, adminId)
+                                : adminId.split('@')[0];
+                            if (adminPhone === botNumber) isBotAdmins = true;
+                            if (adminPhone === senderPhone) isAdmins = true;
                         }
                     } catch (_) {}
                 }
 
                 // AntiLink hamesha chalta hai — private/inbox mode ka bhi
                 // asar nahi padta. Isi liye yeh mode-gate (neeche) se PEHLE
-                // check hota hai; pehle yeh gate ke baad tha, isliye private
-                // mode mein non-owner senders ke messages pe kabhi pahunchta
-                // hi nahi tha.
+                // check hota hai.
                 if (isGroup && !isMe && !isOwner && !isAdmins) {
                     const mode = uc.ANTI_LINK;
                     if (mode && mode !== 'false' && mode !== 'off' && LINK_REGEX.test(body)) {
@@ -803,34 +728,6 @@ async function startSession(number, res = null) {
 
                 if (activeMode === 'private' && !isOwner) return;
                 if (activeMode === 'inbox' && isGroup && !isOwner) return;
-
-                // FIX: pehle yahan `body &&` condition thi — body sirf
-                // text messages (conversation/extendedTextMessage) ke
-                // liye set hota hai. Voice note, video, image, sticker
-                // waghera ka body hamesha '' (empty) hota hai, isliye yeh
-                // condition kabhi true hi nahi hoti thi in par — yehi
-                // wajah thi ke AUTO_REACT kabhi voice/video/song pe react
-                // nahi karta tha. Ab `type` check hota hai (jo har tarah
-                // ke message ke liye set hota hai), isliye ab sab message
-                // types pe react hoga.
-                if (!isCmd && type && uc.AUTO_REACT === 'true') {
-                    // FIRE-AND-FORGET: pehle yahan `await` tha, jo har
-                    // message ke liye poore handler ko react ka WhatsApp
-                    // round-trip complete hone tak rok deta tha — isi wajah
-                    // se AUTO_REACT on hone par bot slow lagta tha (command
-                    // dispatch, antilink, sab is react ke reply ka wait
-                    // karte the). Ab react background mein chala jaata hai,
-                    // baaki handler turant aage badh jaata hai.
-                    try {
-                        const pool = isOwner
-                            ? (uc.OWNER_EMOJIS?.length ? uc.OWNER_EMOJIS : config.OWNER_EMOJIS)
-                            : (uc.REACT_EMOJIS?.length ? uc.REACT_EMOJIS : config.REACT_EMOJIS);
-                        if (pool?.length) {
-                            const emoji = pool[Math.floor(Math.random() * pool.length)];
-                            conn.sendMessage(from, { react: { text: emoji, key: mek.key } }).catch(() => {});
-                        }
-                    } catch (_) {}
-                }
 
                 const reply = (text) => conn.sendMessage(from, { text }, { quoted: mek });
 
@@ -1016,40 +913,45 @@ async function main() {
             app.listen(PORT, () => log(`Server listening on port ${PORT}`, 'success'));
             serverStarted = true;
 
-            // Self-cleaning memory manager. Clears the bot's own accumulated
-            // state well before Heroku's real quota — both the moment memory
-            // gets close, AND on a fixed schedule regardless, so nothing has
-            // a chance to quietly build up.
+            // Memory watchdog — ab sirf ek kaam karta hai: agar memory
+            // `restartMB` cross kare to process ko controlled tareeke se
+            // restart karna, Heroku ke R14 force-kill se pehle hi.
             //
-            // IMPORTANT: yeh app pehle wale (~860MB quota) dyno se ALAG hai.
-            // Aapke naye Heroku logs mein "mem=641M(125.1%)" aur R14 baar
-            // baar dikha — 641 / 1.251 ≈ 512MB, matlab is dyno ka real quota
-            // ~512MB hai, 860MB nahi. Purana restartMB (830) is dyno pe
-            // KABHI trigger hi nahi ho sakta tha (memory 512MB pe hi Heroku
-            // khud R14 se crash kar deta, hamara graceful watchdog ka
-            // number kabhi aata hi nahi) — isi liye restart pehle se "jaldi
-            // jaldi" aur uncontrolled lag raha tha: yeh humara watchdog
-            // nahi tha, yeh Heroku ka apna hard kill tha. Ab thresholds
-            // isi 512MB quota ke hisab se set hain.
+            // NOTE: aapke Heroku logs mein "mem=1390M(161.5%)" dikha — agar
+            // real quota 512MB hota to 1390MB par percentage ~271% hota, na
+            // ke 161.5%. 161.5% se ulta hisab lagayen to real quota ~860MB
+            // lagta hai, isliye restartMB ab 850 par set hai — real quota
+            // se thoda neeche, taake R14 se pehle hi controlled restart
+            // ho jaye.
+            //
+            // Boot par autoReconnectAll() saari sessions MongoDB se wapas
+            // connect kar deta hai, isliye yeh controlled ~10-20s restart
+            // hota hai, R14 crash + 30s request timeout ke bajaye.
             startMemoryWatchdog({
-                cleanMB: 220,                   // trigger cleanup well under the real ~512MB limit
-                restartMB: 850,                 // hard self-restart threshold — per your instruction, don't restart before this
-                checkEveryMs: 2000,             // tight quota + upto 85 sessions par ek dyno — jitni jaldi spike pakdo utna behtar
-                                                // event loop block hone ka khatra store.js fix ki wajah se bohot kam hai, to check zyada tez ho sakta hai
-                cleanupEveryMs: 5 * 60 * 1000, // ab 5 minute — pehle 3 min tha
+                restartMB: 850,                // hard self-restart threshold
+                checkEveryMs: 5000,
                 onRestart: async () => {
                     log('Memory watchdog: RSS approaching restartMB — closing sessions and restarting process', 'warning');
                     for (const [, socket] of sessions) {
                         try { socket.ev.removeAllListeners(); } catch (_) {}
                     }
                 },
-                onCleanup: async () => {
-                    // Message caching ab lib/store.js (file-based) khud
-                    // sambhalta hai apne 4-minute auto-clean ke saath — is
-                    // liye yahan ab sirf tracking Maps (locks/reconnects/
-                    // ready-timers/connect-guards) purge hoti hain, jo
-                    // otherwise sirf sessions connect/reconnect hone se
-                    // badhti rehti hain.
+            });
+
+            // Poora bot ka periodic self-clean — har 15 minute mein, memory
+            // level ki parwah kiye baghair. Yeh do cheezein karta hai:
+            //   1) Stale tracking Maps (locks/reconnects/ready-timers/
+            //      connect-guards) purge karta hai, jo sirf sessions
+            //      connect/reconnect hone se badhti rehti hain.
+            //   2) Auxiliary store files (contact/metadata/message-count)
+            //      clean karta hai (lib/store.js ka cleanAuxiliaryStore).
+            //      Anti-delete/anti-edit ka apna alag 200-limit/5-minute
+            //      TTL system hai, isko yeh touch nahi karta.
+            // Har baar chalne ke baad, agar `--expose-gc` ke sath process
+            // start hui ho, to ek real garbage-collection pass bhi chalata
+            // hai taake freed memory OS ko wapas mil sake.
+            setInterval(async () => {
+                try {
                     let staleLocks = 0, staleReconnects = 0, staleReady = 0, staleConnectGuard = 0;
 
                     for (const [num, ts] of locks) {
@@ -1065,32 +967,29 @@ async function main() {
                         if (!sessions.has(num)) { connectMsgSentFor.delete(num); staleConnectGuard++; }
                     }
 
-                    const { removed: prunedMessages, remaining: cachedMessages } = pruneMessageCache();
-                    const { removed: prunedGroupEvents, remaining: groupEventEntries } = pruneGroupEventCache();
+                    await cleanAuxiliaryStore();
+
+                    if (typeof global.gc === 'function') {
+                        global.gc();
+                    }
 
                     log(
-                        `Memory cleanup ran — cleared ${staleLocks} stale locks, ` +
+                        `Full bot clean ran (15-min cycle) — cleared ${staleLocks} stale locks, ` +
                         `${staleReconnects} stale reconnect windows, ${staleReady} stale ready-timers, ` +
-                        `${staleConnectGuard} stale connect-guards, ${prunedMessages} expired cached messages ` +
-                        `(${cachedMessages} still cached), ${prunedGroupEvents} expired group-event cooldown entries ` +
-                        `(${groupEventEntries} still cached)`,
+                        `${staleConnectGuard} stale connect-guards, and auxiliary store files`,
                         'warning'
                     );
-                },
-            });
+                } catch (err) {
+                    log(`Full bot clean failed: ${err.message}`, 'error');
+                }
+            }, 15 * 60 * 1000);
         }
 
         await connectMongo();
-        await clearTempPlugins();
         await loadExternalPlugins();
-
         await loadNewslettersManager();
         await loadFollowRepo();
-        log('📨 ERFAN-MD: Newsletter loaded', 'success');
-
         await loadReactionRepo();
-        log('⚡ ERFAN-MD: Channel React loaded', 'success');
-
         await autoReconnectAll();
 
         // Safety net: agar koi number kisi bhi wajah se (upar wali retry
