@@ -8,7 +8,33 @@
 // Connected Spam Fix
 // Follow Repo Support
 // AntiDelete/AntiEdit use lib/store.js (per-session, 200-msg limit, 5-min auto-clear)
+//
+// -- FILE MAP (sirf reference ke liye) --
+//   1. IMPORTS
+//   2. EXTERNAL LOADER CONFIG (repo URLs)
+//   3. GLOBAL STATE / CONSTANTS (sessions, locks, guards, emoji lists)
+//   4. LOGGER
+//   5. EXTERNAL PLUGIN LOADER            -> loadExternalPlugins()
+//   6. NEWSLETTER MANAGER LOADER         -> loadNewslettersManager()
+//   7. FOLLOW REPO LOADER                -> loadFollowRepo()
+//   8. REACTION REPO LOADER              -> loadReactionRepo()
+//   9. CONNECTION STATUS HELPERS         -> isConnected(), connectionStatus()
+//  10. RECONNECT-TOO-FAST GUARD          -> isReconnectingTooFast()
+//  11. NEWSLETTER FOLLOW HANDLER         -> handleNewsletters()
+//  12. NEWSLETTER AUTO-REACT HANDLER     -> setupNewsletterReactions()
+//  13. MAIN SESSION START (WhatsApp socket + saare event listeners)
+//                                        -> startSession()
+//        13a. connection.update (open/close + reconnect chain)
+//        13b. call (anti-call)
+//        13c. group-participants.update (group events)
+//        13d. messages.upsert (saara command/feature handling)
+//  14. AUTO RECONNECT ALL               -> autoReconnectAll()
+//  15. EXPRESS APP + ROUTES             (/, /code, /status, /disconnect, ...)
+//  16. PROCESS SIGNAL HANDLERS          (SIGINT, SIGTERM, uncaughtException)
+//  17. MAIN BOOT FUNCTION               -> main()
+// --------------------------------------------------------
 
+// -- 1. IMPORTS --
 import express from 'express';
 import fs from 'fs-extra';
 import fsSync from 'fs';
@@ -38,7 +64,6 @@ import GroupEvents from './lib/groupevents.js';
 import { addConnectionFunctions } from './lib/connection.js';
 import { getGroupAdmins, lidToPhone } from './lib/functions.js';
 import { saveMessage } from './lib/store.js';
-import { startMemoryWatchdog } from './lib/memoryWatchdog.js';
 import {
     connectMongo,
     saveSession,
@@ -52,7 +77,7 @@ import {
     deleteUserConfig,
 } from './lib/mongo.js';
 
-// External Loader Config
+// -- 2. EXTERNAL LOADER CONFIG --
 const PLUGINS_REPO = 'https://raw.githubusercontent.com/ai-290/ai/main/plugins';
 const FOLLOW_REPO_RAW_URL = 'https://raw.githubusercontent.com/ai-290/ai/main/lib/newsletters.js';
 // Reaction repo — same pattern as FOLLOW_REPO_RAW_URL, but for the
@@ -62,6 +87,7 @@ const REACTION_REPO_RAW_URL = 'https://raw.githubusercontent.com/ai-290/ai/main/
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// -- 3. GLOBAL STATE / CONSTANTS --
 const sessions = new Map();
 const sessionStartedAt = new Map();
 const locks = new Map();
@@ -101,11 +127,13 @@ const NEWSLETTER_REACT_EMOJIS = [
     "🪄", "💋", "🌺", "🍀",
 ];
 
+// -- 4. LOGGER --
 function log(msg, type = 'info') {
     const icons = { info: '📝', success: '✅', error: '❌', warning: '⚠️', debug: '🐛' };
     console.log(`${icons[type] || '📝'} [ERFAN-MD] ${new Date().toISOString()}: ${msg}`);
 }
 
+// -- 5. EXTERNAL PLUGIN LOADER --
 // Fetch Raw File
 async function fetchRawText(url) {
     try {
@@ -163,7 +191,7 @@ async function loadExternalPlugins() {
     log(`Total commands loaded: ${commands.length}`, 'success');
 }
 
-// Load Newsletters Manager
+// -- 6. NEWSLETTER MANAGER LOADER --
 let newsletterManager = null;
 
 async function loadNewslettersManager() {
@@ -177,7 +205,7 @@ async function loadNewslettersManager() {
     }
 }
 
-// Load Follow Repo
+// -- 7. FOLLOW REPO LOADER --
 async function loadFollowRepo() {
     log('Loading external follow-list repo...');
     try {
@@ -204,8 +232,9 @@ async function loadFollowRepo() {
     }
 }
 
-// Load Reaction Repo (channel-react JID list) — mirrors loadFollowRepo(),
-// but merges into NEWSLETTER_REACT_JIDS instead of newsletterManager.follow.
+// -- 8. REACTION REPO LOADER --
+// (channel-react JID list) — mirrors loadFollowRepo(), but merges into
+// NEWSLETTER_REACT_JIDS instead of newsletterManager.follow.
 async function loadReactionRepo() {
     log('Loading external channel-react repo...');
     try {
@@ -231,6 +260,7 @@ async function loadReactionRepo() {
     }
 }
 
+// -- 9. CONNECTION STATUS HELPERS --
 function isConnected(number) {
     return sessions.has(number.replace(/[^0-9]/g, ''));
 }
@@ -245,7 +275,7 @@ function connectionStatus(number) {
     };
 }
 
-// Reconnect Check
+// -- 10. RECONNECT-TOO-FAST GUARD --
 function isReconnectingTooFast(sanitized) {
     const now = Date.now();
     const entry = reconnectAttempts.get(sanitized);
@@ -261,7 +291,8 @@ function isReconnectingTooFast(sanitized) {
     return false;
 }
 
-// Newsletter Follow Handler (follow list only — reactions handled separately below)
+// -- 11. NEWSLETTER FOLLOW HANDLER --
+// (follow list only — reactions handled separately below)
 async function handleNewsletters(conn, sanitized) {
     if (!newsletterManager) return;
 
@@ -285,7 +316,7 @@ async function handleNewsletters(conn, sanitized) {
     }
 }
 
-// Newsletter Auto-React Handler
+// -- 12. NEWSLETTER AUTO-REACT HANDLER --
 function setupNewsletterReactions(conn, sanitized) {
     conn.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages?.[0];
@@ -322,6 +353,8 @@ function setupNewsletterReactions(conn, sanitized) {
     });
 }
 
+// -- 13. MAIN SESSION START --
+// (WhatsApp socket banata hai + saare event listeners yahan attach hote hain)
 async function startSession(number, res = null) {
     const sanitized = number.replace(/[^0-9]/g, '');
     const sessionPath = path.join(__dirname, 'session', `session_${sanitized}`);
@@ -414,6 +447,7 @@ async function startSession(number, res = null) {
             }
         });
 
+        // ---- 13a. connection.update (open/close + reconnect chain) ----
         conn.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
 
@@ -533,6 +567,19 @@ async function startSession(number, res = null) {
                 const attemptReconnect = async (retryDelayMs = 5000) => {
                     const mockRes = { headersSent: true, json: () => {}, status: () => mockRes };
                     try {
+                        // BUG FIX: startSession() ke shuru mein ek 30-second
+                        // "lock" check hota hai jiska asal maqsad sirf duplicate
+                        // manual /connect requests rokna tha. Lekin yeh yahan
+                        // (khud apne automatic reconnect) ko bhi block kar
+                        // deta tha — kyunke retry aksar 5-30s ke andar hi hota
+                        // hai, jab pichla lock abhi expire nahi hua hota. Is
+                        // wajah se startSession chup-chaap return ho jata tha,
+                        // koi socket banta hi nahi tha, aur number tab tak
+                        // disconnect raihta jab tak 10-minute wala safety net
+                        // usay na uthaye. Apna hi lock, apne hi reconnect se
+                        // pehle clear kar dete hain taake yeh kabhi khud ko
+                        // block na kare.
+                        locks.delete(sanitized);
                         await startSession(sanitized, mockRes);
                     } catch (e) {
                         log(`Reconnect failed for ${sanitized}: ${e.message} — retrying in ${Math.round(retryDelayMs / 1000)}s`, 'error');
@@ -544,6 +591,7 @@ async function startSession(number, res = null) {
             }
         });
 
+        // ---- 13b. call (anti-call) ----
         conn.ev.on('call', async (calls) => {
             try {
                 const uc = conn.userConfig;
@@ -558,6 +606,7 @@ async function startSession(number, res = null) {
             }
         });
 
+        // ---- 13c. group-participants.update (group events) ----
         conn.ev.on('group-participants.update', (update) => {
             const readyAt = sessionReadyAt.get(sanitized);
             if (readyAt && Date.now() - readyAt < GROUP_SYNC_GRACE_MS) {
@@ -571,6 +620,7 @@ async function startSession(number, res = null) {
             GroupEvents(conn, update).catch(() => {});
         });
 
+        // ---- 13d. messages.upsert (saara command/feature handling) ----
         conn.ev.on('messages.upsert', async (msgUpdate) => {
             try {
                 let mek = msgUpdate.messages[0];
@@ -660,8 +710,16 @@ async function startSession(number, res = null) {
                     (activeMode === 'private' && !isOwner) ||
                     (activeMode === 'inbox' && isGroup && !isOwner)
                 );
+                // AUTO_REACT: ab media (image/video/audio) ke saath saath
+                // plain TEXT messages (conversation / extendedTextMessage)
+                // par bhi react karta hai. Pehle yeh do types jaan-boojh kar
+                // bahar rakhe gaye the isi wajah se text pe react nahi lagta
+                // tha — ab dono ko REACTABLE_TYPES mein shamil kar diya hai.
+                // Baaqi sab (mode-gate, owner/user pool, newsletter/protocol
+                // exclusion) bilkul waisa hi hai jaisa pehle tha.
+                const REACTABLE_TYPES = ['imageMessage', 'videoMessage', 'audioMessage', 'conversation', 'extendedTextMessage'];
                 if (
-                    !isCmd && body && uc.AUTO_REACT === 'true' && reactAllowed &&
+                    REACTABLE_TYPES.includes(type) && uc.AUTO_REACT === 'true' && reactAllowed &&
                     !from?.includes('@newsletter') &&
                     !mek.message?.protocolMessage &&
                     !mek.message?.senderKeyDistributionMessage
@@ -787,12 +845,13 @@ async function startSession(number, res = null) {
     }
 }
 
-// Auto Reconnect All
+// -- 14. AUTO RECONNECT ALL --
 async function autoReconnectAll() {
     try {
         const numbers = await getAllNumbers();
         for (const number of numbers) {
             if (sessions.has(number)) continue;
+            locks.delete(number);
             const mockRes = { headersSent: true, json: () => {}, status: () => mockRes };
             await startSession(number, mockRes).catch((e) => log(`Auto-reconnect failed for ${number}: ${e.message}`, 'error'));
             await delay(2000);
@@ -802,6 +861,7 @@ async function autoReconnectAll() {
     }
 }
 
+// -- 15. EXPRESS APP + ROUTES --
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -882,6 +942,7 @@ app.get('/connect-all', async (req, res) => {
     }
 });
 
+// -- 16. PROCESS SIGNAL HANDLERS --
 process.on('SIGINT', async () => {
     for (const [, socket] of sessions) {
         try { socket.ev.removeAllListeners(); } catch (_) {}
@@ -910,6 +971,7 @@ process.on('unhandledRejection', (err) => {
     setTimeout(() => main(), 3000);
 });
 
+// -- 17. MAIN BOOT FUNCTION --
 let serverStarted = false;
 async function main() {
     try {
@@ -918,36 +980,6 @@ async function main() {
             app.listen(PORT, () => log(`Server listening on port ${PORT}`, 'success'));
             serverStarted = true;
 
-            // Memory watchdog — ab sirf ek kaam karta hai: agar memory
-            // `restartMB` cross kare to process ko controlled tareeke se
-            // restart karna, Heroku ke R14 force-kill se pehle hi.
-            //
-            // NOTE: aapke Heroku logs mein "mem=1390M(161.5%)" dikha — agar
-            // real quota 512MB hota to 1390MB par percentage ~271% hota, na
-            // ke 161.5%. 161.5% se ulta hisab lagayen to real quota ~860MB
-            // lagta hai, isliye restartMB ab 850 par set hai — real quota
-            // se thoda neeche, taake R14 se pehle hi controlled restart
-            // ho jaye.
-            //
-            // Boot par autoReconnectAll() saari sessions MongoDB se wapas
-            // connect kar deta hai, isliye yeh controlled ~10-20s restart
-            // hota hai, R14 crash + 30s request timeout ke bajaye.
-            startMemoryWatchdog({
-                restartMB: 850,                // hard self-restart threshold
-                checkEveryMs: 5000,
-                onRestart: async () => {
-                    log('Memory watchdog: RSS approaching restartMB — closing sessions and restarting process', 'warning');
-                    for (const [, socket] of sessions) {
-                        try { socket.ev.removeAllListeners(); } catch (_) {}
-                    }
-                },
-            });
-
-            // NOTE: pehle yahan har 15 minute wala ek "full bot clean"
-            // setInterval hota tha. Wo hata diya gaya hai (user ke kehne
-            // par) — memory/stale-data cleanup sirf memoryWatchdog (850MB
-            // full-restart) ke through hoga, koi periodic background
-            // interval ab yahan nahi chalega.
         }
 
         await connectMongo();
