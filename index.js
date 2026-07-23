@@ -179,6 +179,17 @@ async function loadExternalPlugins() {
     }
     // ============================================================
 
+    // ============================================================
+    // ==== MEMORY CACHE CLEAR FIX (YEH LINE ZAROORI HAI) =========
+    // ============================================================
+    // Bhai yeh line zaroori hai! Agar commands array clear nahi karenge
+    // to purane commands memory mein cached reh jayenge aur naye plugins
+    // ke saath mix ho jayenge. Isliye har restart pe pehle commands clear
+    // karo phir naye load karo.
+    commands.length = 0;
+    log('🧹 OLD COMMANDS CLEARED FROM MEMORY — cache wiped clean', 'success');
+    // ============================================================
+
     const apiUrl = 'https://api.github.com/repos/ai-290/ai/contents/plugins';
     let pluginFiles = [];
 
