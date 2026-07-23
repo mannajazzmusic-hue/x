@@ -137,7 +137,7 @@ function log(msg, type = 'info') {
 // Fetch Raw File
 async function fetchRawText(url) {
     try {
-        const res = await fetch(url);
+        const res = await fetch(url, { cache: 'no-store' }); // CDN cache bypass
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return await res.text();
     } catch (e) {
@@ -150,11 +150,23 @@ async function fetchRawText(url) {
 async function loadExternalPlugins() {
     log('Loading external plugins from GitHub...');
 
-    const apiUrl = 'https://api.github.com/repos/ai-290/ai/contents/plugins';
+    // FIX: .temp_plugins folder restart ke darmiyan persist karta tha,
+    // isi wajah se purane/deleted plugin files disk pe pade reh jaate
+    // the. Ab har boot pe pehle yeh folder poora clear karte hain taake
+    // sirf naye, current plugins hi disk pe hon.
+    const tempPluginsDir = path.join(__dirname, '.temp_plugins');
+    try {
+        await fs.emptyDir(tempPluginsDir);
+    } catch (e) {
+        log(`Failed to clear old temp plugins: ${e.message}`, 'warning');
+    }
+
+    // Cache-busting query + no-store, taake GitHub API bhi fresh listing de
+    const apiUrl = `https://api.github.com/repos/ai-290/ai/contents/plugins?t=${Date.now()}`;
     let pluginFiles = [];
 
     try {
-        const res = await fetch(apiUrl);
+        const res = await fetch(apiUrl, { cache: 'no-store' });
         if (res.ok) {
             const data = await res.json();
             pluginFiles = data.filter(f => f.name.endsWith('.js')).map(f => f.name);
@@ -172,12 +184,16 @@ async function loadExternalPlugins() {
     log(`Found ${pluginFiles.length} external plugins...`);
 
     for (const file of pluginFiles) {
-        const rawUrl = `${PLUGINS_REPO}/${file}`;
+        // FIX: raw.githubusercontent.com ke CDN cache ko bypass karne ke
+        // liye yahan bhi timestamp query lagayi — pehle sirf import()
+        // wale hisse mein cache-bust hota tha, fetch khud purana content
+        // la sakta tha.
+        const rawUrl = `${PLUGINS_REPO}/${file}?t=${Date.now()}`;
         try {
             const code = await fetchRawText(rawUrl);
             if (!code) continue;
 
-            const tempPath = path.join(__dirname, '.temp_plugins', file);
+            const tempPath = path.join(tempPluginsDir, file);
             await fs.ensureDir(path.dirname(tempPath));
             await fs.writeFile(tempPath, code);
 
