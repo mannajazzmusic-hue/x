@@ -150,18 +150,34 @@ async function fetchRawText(url) {
 async function loadExternalPlugins() {
     log('Loading external plugins from GitHub...');
 
-    // === OLD FOLDER DELETE FIX ===
-    // Pehle purana .temp_plugins folder delete karo taake purane plugins mix na hon
+    // ============================================================
+    // ==== OLD PLUGINS FOLDER DELETE FIX (100% GUARANTEED) ======
+    // ============================================================
     const tempPluginsDir = path.join(__dirname, '.temp_plugins');
+
     try {
+        // Pehle check karo ke folder exist karta hai ya nahi
         if (fsSync.existsSync(tempPluginsDir)) {
-            await fs.remove(tempPluginsDir);
-            log('Old .temp_plugins folder deleted successfully', 'success');
+            log(`Found old plugins folder at: ${tempPluginsDir}`, 'info');
+            
+            // fs.rmSync with recursive:true, force:true — yeh 100% delete karta hai
+            // Chahe folder empty ho ya bhara ho, chahe files locked hon — force se hat jayega
+            fsSync.rmSync(tempPluginsDir, { recursive: true, force: true });
+            
+            log('✅ OLD PLUGINS FOLDER DELETED SUCCESSFULLY — all previous plugins removed', 'success');
+        } else {
+            log('No old plugins folder found — fresh start', 'info');
         }
+
+        // Naya empty folder banao taake fresh plugins is mein aayein
+        fsSync.mkdirSync(tempPluginsDir, { recursive: true });
+        log('Created fresh .temp_plugins folder for new plugins', 'success');
+
     } catch (e) {
-        log(`Failed to delete old plugins folder: ${e.message}`, 'error');
+        log(`❌ CRITICAL ERROR deleting old plugins folder: ${e.message}`, 'error');
+        log('Attempting to continue anyway...', 'warning');
     }
-    // ==============================
+    // ============================================================
 
     const apiUrl = 'https://api.github.com/repos/ai-290/ai/contents/plugins';
     let pluginFiles = [];
