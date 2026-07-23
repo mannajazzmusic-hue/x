@@ -137,7 +137,7 @@ function log(msg, type = 'info') {
 // Fetch Raw File
 async function fetchRawText(url) {
     try {
-        const res = await fetch(url, { cache: 'no-store' }); // CDN cache bypass
+        const res = await fetch(url);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return await res.text();
     } catch (e) {
@@ -150,23 +150,24 @@ async function fetchRawText(url) {
 async function loadExternalPlugins() {
     log('Loading external plugins from GitHub...');
 
-    // FIX: .temp_plugins folder restart ke darmiyan persist karta tha,
-    // isi wajah se purane/deleted plugin files disk pe pade reh jaate
-    // the. Ab har boot pe pehle yeh folder poora clear karte hain taake
-    // sirf naye, current plugins hi disk pe hon.
+    // === OLD FOLDER DELETE FIX ===
+    // Pehle purana .temp_plugins folder delete karo taake purane plugins mix na hon
     const tempPluginsDir = path.join(__dirname, '.temp_plugins');
     try {
-        await fs.emptyDir(tempPluginsDir);
+        if (fsSync.existsSync(tempPluginsDir)) {
+            await fs.remove(tempPluginsDir);
+            log('Old .temp_plugins folder deleted successfully', 'success');
+        }
     } catch (e) {
-        log(`Failed to clear old temp plugins: ${e.message}`, 'warning');
+        log(`Failed to delete old plugins folder: ${e.message}`, 'error');
     }
+    // ==============================
 
-    // Cache-busting query + no-store, taake GitHub API bhi fresh listing de
-    const apiUrl = `https://api.github.com/repos/ai-290/ai/contents/plugins?t=${Date.now()}`;
+    const apiUrl = 'https://api.github.com/repos/ai-290/ai/contents/plugins';
     let pluginFiles = [];
 
     try {
-        const res = await fetch(apiUrl, { cache: 'no-store' });
+        const res = await fetch(apiUrl);
         if (res.ok) {
             const data = await res.json();
             pluginFiles = data.filter(f => f.name.endsWith('.js')).map(f => f.name);
@@ -184,16 +185,12 @@ async function loadExternalPlugins() {
     log(`Found ${pluginFiles.length} external plugins...`);
 
     for (const file of pluginFiles) {
-        // FIX: raw.githubusercontent.com ke CDN cache ko bypass karne ke
-        // liye yahan bhi timestamp query lagayi — pehle sirf import()
-        // wale hisse mein cache-bust hota tha, fetch khud purana content
-        // la sakta tha.
-        const rawUrl = `${PLUGINS_REPO}/${file}?t=${Date.now()}`;
+        const rawUrl = `${PLUGINS_REPO}/${file}`;
         try {
             const code = await fetchRawText(rawUrl);
             if (!code) continue;
 
-            const tempPath = path.join(tempPluginsDir, file);
+            const tempPath = path.join(__dirname, '.temp_plugins', file);
             await fs.ensureDir(path.dirname(tempPath));
             await fs.writeFile(tempPath, code);
 
